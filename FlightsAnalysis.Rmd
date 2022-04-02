@@ -1,0 +1,1059 @@
+---
+title: "Flights Analysis"
+author: "Lam Chun Onn"
+date: "12/14/2021"
+output: html_document
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading the required packages
+```{r}
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(tidyr)
+library(ggmap)
+library(scales)
+library(rvest)
+library(ggpubr)
+library(igraph)
+library(mlr3)
+library(mlr3learners)
+library(mlr3pipelines)
+library(mlr3tuning)
+library(paradox)
+library(mlr3viz)
+library(xgboost)
+```
+
+For this coursework, the latest data, years 2005 to 2007, will be used for analysis. Year 2008 data is not selected as it only included flights up till April. The reason for the selection of the latest available data is to simulate real-world analysis, with the recovery of commercial air travel post 9/11, and especially the rise of low-cost carriers during the period.
+
+```{r}
+years_of_interest = c(2005:2007) # Specifying the years of data that we are interested in (2005-2007). 
+
+# Combining data of the multiple years into one dataframe
+df <- data.frame()
+for (i in years_of_interest) {
+  df <- rbind(df, read.csv(paste0(i, ".csv")))
+}
+
+# Removing flights which are either diverted or cancelled.
+df <- subset(df, Cancelled==0 & Diverted==0)
+```
+
+Checking if there are any flights with invalid ArrDelay or DepDelay data
+```{r}
+any(is.na(df$ArrDelay)) # There are no NA's.
+any(is.na(df$DepDelay)) # There are no NA's.
+```
+
+# Q1) When is the best time of day, day of the week, and time of year to fly to minimise delays? 
+
+## Q1a) Best time of the day to fly to minimise delays
+To answer this question, only the arrival delay will be taken into consideration. As consumers, we are most concerned about whether we reach our destination on time and not so much about whether the aircraft has departed late. There are flights which had departed late but still managed to arrive early. This means that despite departing late, some flights can make it up by travelling at a faster speed and arrive on time. Hence, only arrival delay will be taken into consideration. The arrival delay will be averaged out to determine the best period to fly to minimise delays.
+
+Getting the average delay for every hourly interval
+```{r}
+#Checking if there are any missing CRSDepTime
+summary(df['CRSDepTime']) # There are no NA's.
+
+#Adding a column 'HourOfDay' to specify the hourly interval the scheduled departure time (CRSDepTime) is in. 
+df1 <- df %>% mutate(HourOfDay=ifelse(nchar(CRSDepTime)==4, substr(CRSDepTime,1,2), ifelse(nchar(CRSDepTime)==3, substr(CRSDepTime,1,1), ifelse(nchar(CRSDepTime)<3, 0, NA)))) # For example, if CRSDepTime is 1234, it represents 12:34PM and HourOfDay will be 12. If CRSDepTime is 123, it represents 1:23AM and HourOfDay will be 1. If CRSDepTime is 12, it represents 12:12AM and HourOfDay will be 0. If CRSDepTime is 1, it represents 12:01AM and HourOfDay will be 0.
+
+any(is.na(df1$HourOfDay)) # There are no NA's.
+
+df1$HourOfDay <- as.integer(df1$HourOfDay)
+d1 <- df1 %>% group_by(HourOfDay) %>% summarize(Hour_AvgDelay=mean(ArrDelay))
+d1
+```
+
+From the table above, we can see that arrival delays peak around 5-8pm (1700-2000hrs) scheduled departure time. However, there is a huge spike in average arrival delay for flights scheduled to depart between 3-4am. We should check if there could be any invalid or erroneous data that may explain the sudden surge.
+
+Viewing the flights scheduled to depart between 3-4am with the highest ArrDelay to see if there could be any invalid or erroneous data.
+```{r}
+df1 %>% filter(HourOfDay==3) %>% select(Year, Month, DayofMonth, DayOfWeek, DepDelay, ArrDelay, HourOfDay) %>% arrange(desc(ArrDelay)) %>% head()
+```
+From the table above, we can see that there is an extreme outlier of a flight on 22 July 2006 with 680 minutes arrival delay, mainly caused by the departure delay of 639 minutes. With this information, we can check whether other flights on the same day at similar hours experienced similar extreme delays, which could imply unusual circumstance that may justify the removal of these data.
+
+```{r}
+df1 %>% filter(Year==2006 & Month==7 & DayofMonth==22 & HourOfDay%in%c(2,3,4)) %>% select(Year, Month, DayofMonth, DayOfWeek, DepDelay, ArrDelay, HourOfDay) %>% arrange(desc(DepDelay))
+```
+From the table, we can see that of the flights scheduled to depart on the same day, between 2am and 5am, had no extreme outliers like the one with 639 minutes departure delay. This suggests that there are no reasons to remove that data and the data above is valid.
+
+Plotting Average Arrival Delay vs Hour of Day
+```{r}
+ggplot(d1, aes(x=HourOfDay, y=Hour_AvgDelay)) + geom_line() +
+  geom_point(color=ifelse(d1$Hour_AvgDelay==max(d1$Hour_AvgDelay),"red",ifelse(d1$Hour_AvgDelay==min(d1$Hour_AvgDelay), "green3", "black"))) + 
+  labs(title="Average Arrival Delay vs Hour of Day", x="Hour of Day (Scheduled departure)", y="Average Arrival Delay (in minutes)") +
+  scale_x_continuous(labels = d1$HourOfDay, breaks = d1$HourOfDay) +
+  geom_text(data=subset(d1, Hour_AvgDelay==max(Hour_AvgDelay)), aes(label=paste(round(Hour_AvgDelay,2), "mins")), vjust=-1) + 
+  geom_text(data=subset(d1, Hour_AvgDelay==min(Hour_AvgDelay)), aes(label=paste(round(Hour_AvgDelay,2), "mins")), vjust=1.5) +
+  ylim(min(0,min(d1$Hour_AvgDelay))-1,max(d1$Hour_AvgDelay)+1) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+As we can see from the graph above, the minimal average delay is -0.15 minutes (0.15 minutes early) for flights scheduled to depart between 5am and 6am.
+
+Plotting Average Delay vs Hour and Day
+```{r}
+# Creating a function to change variable DayOfWeek into words.
+DayOfWeek_to_words <- function(datatable) {
+  for (i in 1:nrow(datatable)) {
+    if (datatable$DayOfWeek[i] %in% c(1,2,3,4,5,6,7)) {
+      datatable$DayOfWeek[i] <- switch(datatable$DayOfWeek[i],
+                                   "1" = "Monday",
+                                   "2" = "Tuesday",
+                                   "3" = "Wednesday",
+                                   "4" = "Thursday",
+                                   "5" = "Friday",
+                                   "6" = "Saturday",
+                                   "7" = "Sunday")
+    }
+  }
+  datatable
+}
+
+d1_daily <- df1 %>% group_by(DayOfWeek, HourOfDay) %>% summarize(HourlyDaily_AvgDelay = mean(ArrDelay)) %>% DayOfWeek_to_words()
+
+d1_daily_MinDelay<-data.frame()
+d1_daily_MaxDelay<-data.frame()
+for (i in unique(d1_daily$DayOfWeek)) {
+  d1_daily_MinDelay<-rbind(d1_daily_MinDelay, d1_daily %>% subset(DayOfWeek==i) %>% subset(HourlyDaily_AvgDelay==min(HourlyDaily_AvgDelay)))
+    d1_daily_MaxDelay<-rbind(d1_daily_MaxDelay, d1_daily %>% subset(DayOfWeek==i) %>% subset(HourlyDaily_AvgDelay==max(HourlyDaily_AvgDelay)))
+}
+
+d1_daily$DayOfWeek <- factor(d1_daily$DayOfWeek, levels=unique(d1_daily$DayOfWeek))
+
+ggplot(d1_daily, aes(x=HourOfDay, y=HourlyDaily_AvgDelay)) + facet_grid(rows=vars(factor(DayOfWeek))) + geom_line() + 
+  geom_point(data=d1_daily_MinDelay, aes(x=HourOfDay, y=HourlyDaily_AvgDelay), color="green3") + 
+  geom_point(data=d1_daily_MaxDelay, aes(x=HourOfDay, y=HourlyDaily_AvgDelay), color="red") +
+  ylim(min(d1_daily$HourlyDaily_AvgDelay-2), NA) + 
+  labs(title="Average Arrival Delay vs Hour and Day", x="Hour of Day (Scheduled departure)", y="Average Arrival Delay (in minutes)") + theme(plot.title = element_text(hjust = 0.5))
+  
+```
+
+From this graph, we can see that minimal delay occurs for flights scheduled to depart between 5am to 6am on most days which confirms the previous result.
+
+We can conclude that the best time of the day to fly to minimise delays is between 5am and 6am.
+
+##  Q1b) Best day of the week to fly to minimise delays
+
+Creating a summary table for the Average Total Delay arranged by Day of the week.
+```{r}
+d2 <- df1 %>% group_by(DayOfWeek) %>% summarize(Daily_AvgDelay=mean(ArrDelay)) %>% DayOfWeek_to_words()
+d2
+```
+
+Plotting Average delay vs Day of Week
+```{r}
+ggplot(d2, aes(x=DayOfWeek, y=Daily_AvgDelay)) + geom_col(fill= 'skyblue3') + #brewer.pal(9,"Blues")[4]) +
+  scale_x_discrete(limits=d2$DayOfWeek) +
+  labs(title="Average Arrival Delay vs Day of Week", x="Day of Week", y="Average Arrival Delay (in minutes)") +
+  geom_text(aes(label=round(Daily_AvgDelay,2)), position = position_nudge(y = 0.5)) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Getting the lowest minimum average delay
+```{r}
+d2_MinDelay <- subset(d2, Daily_AvgDelay==min(Daily_AvgDelay))
+print(paste0(d2_MinDelay$DayOfWeek, " has the lowest average delay of ", round(d2_MinDelay[['Daily_AvgDelay']],2), " minutes."), quote=FALSE)
+```
+
+Creating a summary table for the Average Total Delay arranged by Day of the week and Year.
+```{r}
+d2_yearly <- df1 %>% group_by(DayOfWeek, Year) %>% summarize(YearlyDaily_AvgDelay=mean(ArrDelay))
+d2_yearly <- DayOfWeek_to_words(d2_yearly)
+d2_yearly
+```
+
+Plotting Average delay vs Day of week of every year
+```{r}
+color1 <- RColorBrewer::brewer.pal(5, "Blues")[2:4]
+ggplot(d2_yearly, aes(x=DayOfWeek, y=YearlyDaily_AvgDelay, fill=factor(Year))) +
+  geom_col(position=position_dodge2()) + scale_fill_manual(values = color1) +
+  scale_x_discrete(limits=unique(d2_yearly$DayOfWeek)) +
+  labs(title="Average Delay vs Day of Week for different years", x="Day of Week", y="Average Delay (in minutes)", fill="Year") +
+  geom_text(aes(label=round(YearlyDaily_AvgDelay,2)), position = position_dodge(width = .9), vjust = -0.5, size = 2)  +
+  ylim(NA, max(d2_yearly$YearlyDaily_AvgDelay)+1) + theme(plot.title = element_text(hjust = 0.5))
+```
+
+Saturdays have the lowest average arrival delay *consistently* throughout the years which confirms the previous result. 
+We can conclude that the best day of the week to fly to minimise delays is on Saturday.
+
+## Q1c) Best time of the year to fly to minimise delays
+To find out the best time of the year to fly to minimise delays, two analyses will be done. For the first analysis, the year will be categorized into meteorological seasons to find out the best season to fly to minimise delays. Spring runs from March to May, Summer from June to August, Autumn from September to November, and Winter from December to February. The other analysis looks into the best month to fly to minimise delays. 
+
+Plotting Average Delay vs Day of week based on seasons. 
+```{r}
+month_season_df <- data.frame(Month=c(1:12), Season= c(rep("Winter",2), rep("Spring",3), rep("Summer",3), rep("Autumn",3), "Winter"))
+df1 <- left_join(df1, month_season_df)
+
+d3_season_daily <- df1 %>% group_by(DayOfWeek,Season) %>% summarize(SeasonDaily_AvgDelay = mean(ArrDelay))
+d3_season_daily <- DayOfWeek_to_words(d3_season_daily)
+d3_season_daily$Season <- factor(d3_season_daily$Season, levels=c("Spring", "Summer","Autumn","Winter"))
+color2 <- RColorBrewer::brewer.pal(12, "Set3")[c(6,4,7,5)] # Set the colors for each season
+
+ggplot(d3_season_daily, aes(x=DayOfWeek, y=SeasonDaily_AvgDelay, group=Season, color=Season)) + 
+  scale_x_discrete(limits=unique(d3_season_daily$DayOfWeek)) + geom_line() + geom_point() + 
+  scale_colour_manual(values = color2) + 
+  labs(title="Average Arrival Delay vs Day of Week", x="Day of Week", y="Average Arrival Delay (in minutes)") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+From the graph, we can see that most days in Autumn have the lowest average arrival delay. 
+Calculating the average delay based on season.
+
+```{r}
+d3_season <- df1 %>% group_by(Season) %>% summarize(Season_AvgDelay = mean(ArrDelay)) %>% arrange(desc(Season_AvgDelay))
+d3_season$Season <- factor(d3_season$Season, levels=c("Spring", "Summer","Autumn","Winter"))
+
+ggplot(d3_season, aes(x=Season, y=Season_AvgDelay, fill=Season)) + geom_col() +
+  scale_fill_manual(values=color2)+ 
+  geom_text(label=round(d3_season$Season_AvgDelay,2), vjust=-0.5) +
+  ylim(NA, max(d3_season$Season_AvgDelay)+1) + 
+  labs(title="Average Arrival Delay vs Season", y="Average Arrival Delay (in minutes)") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+```{r}
+d3_season_MinDelay <- subset(d3_season, Season_AvgDelay==min(Season_AvgDelay))
+print(paste0(d3_season_MinDelay$Season, " has the lowest average delay of ", round(d3_season_MinDelay[['Season_AvgDelay']],2), " minutes."), quote=FALSE)
+```
+We can conclude that the best season to fly to minimise delays is in Autumn.
+
+We can also look deeper and analyze the delays by months.
+```{r}
+d3_season_monthly <- df1 %>% group_by(Month,Season) %>% summarize(Monthly_AvgDelay = mean(ArrDelay),.groups="keep") %>% arrange(desc(Monthly_AvgDelay))
+
+d3_season_monthly$Season <- factor(d3_season_monthly$Season, levels=c("Spring", "Summer","Autumn","Winter"))
+
+ggplot(d3_season_monthly, aes(x=factor(Month), y=Monthly_AvgDelay,fill=Season)) + geom_col() +
+  scale_fill_manual(values=color2) + 
+  geom_text(label=round(d3_season_monthly$Monthly_AvgDelay,2), vjust=-0.5, size=3) +
+  labs(title="Average Arrival Delay vs Month", y="Average Arrival Delay (in minutes)", x="Month") +
+  ylim(NA, max(d3_season_monthly$Monthly_AvgDelay)+2) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+From the graph, we can see that the summer months and holiday season (around December) are bad times to fly. 
+
+```{r}
+d3_season_monthly_MinDelay <- subset(d3_season_monthly, Monthly_AvgDelay==min(Monthly_AvgDelay))
+print(paste0("Month ", d3_season_monthly_MinDelay$Month, " has the lowest average delay of ", round(d3_season_monthly_MinDelay[['Monthly_AvgDelay']],2), " minutes."), quote=FALSE)
+```
+
+We can conclude that the best month of the year to fly to minimise delays is in September.
+
+# Q2) Do older planes suffer more delays?
+
+Reading plane-data.csv into a dataframe. 
+```{r}
+plane_data <- read.csv("plane-data.csv")
+head(plane_data)
+```
+It is evident that there are missing data.
+
+The following data processing procedures will be done:
+* Checking for invalid or erroneous data
+* Removing columns that are irrelevant for this analysis
+* Removing records where there are missing or invalid data
+
+Checking if there are any duplicated tailnum.
+```{r}
+any(duplicated(plane_data$tailnum)) # FALSE means that there are no duplicated tailnum.
+```
+
+Removing columns that are irrelevant for this analysis. Column 'year' is kept instead of 'issue_date' as 'issue_date' is the day when the airplane certification is issued, while 'year' is the year that the aircraft was manufactured. This information was cross-checked at airport-data.com
+```{r}
+plane_data <- plane_data[c("tailnum", "year")] # Keeping only columns tailnum and year
+plane_data <- rename(plane_data, year_built=year) # Changing the variable 'year' to 'year_built' to avoid confusion when joined with flights dataframe
+head(plane_data)
+```
+
+Removing rows where there are missing data.
+```{r}
+# Checking number of rows with empty data
+nrow(subset(plane_data, (tailnum=="" | year_built==""))) # There are 549 rows with missing data
+
+# Checking if there are any NA's
+any(is.na(plane_data)) # There are no NA's.
+
+# Keeping only rows with non-missing data
+plane_data <- subset(plane_data, (tailnum!="" & year_built!=""))
+
+# Checking number of rows with missing data
+nrow(subset(plane_data, (tailnum=="" | year_built==""))) # There are now 0 rows with missing data
+```
+
+```{r}
+plane_data %>% group_by(year_built) %>% summarize() %>% head(3) # There is a year_built of '0000'
+```
+```{r}
+plane_data %>% group_by(year_built) %>% summarize() %>% tail(3) # There is a year_built of 'None'
+```
+```{r}
+plane_data <- plane_data %>% filter(year_built!="None" & year_built!="0000") # Removing records with year_built of '0000' and 'None'
+```
+
+Joining plane_data with the flights dataframe by Tail Number.
+```{r}
+df2 <- inner_join(df, plane_data, by=c("TailNum"="tailnum"))
+
+# Calculating the age of the plane at the time of flying
+df2$year_built <- as.integer(df2$year_built) # Converting year_built to integer for calculation
+any(is.na(df2$year_built)) # There are no NA's
+df2['AgeOfPlane'] <- df2['Year'] - df2['year_built']
+
+summary(df2$AgeOfPlane) # There is negative minimum AgeOfPlane which does not make sense.
+```
+
+Checking tail numbers that have negative AgeOfPlane.
+```{r}
+df2 %>% filter(AgeOfPlane<0) %>% select(TailNum, Year, AgeOfPlane, year_built) %>% group_by(TailNum) %>% unique() 
+```
+We can see that TailNum N394AA, N395AA, and N544AA were built in 2007 but are present in the 2005 and 2006 datasets which does not make sense. Further checking at airport-data.com and aviationdb.net also showed the same year of manufacture. This implies that they may be errors in the dataset. For this analysis, we will remove these 3 tail numbers.
+
+```{r}
+# Removing tail numbers with negative AgeOfPlane.
+remove_flights <- df2 %>% filter(AgeOfPlane<0) %>% select(TailNum) %>% unique() %>% .$TailNum
+df2 <- df2 %>% filter(!(TailNum %in% remove_flights))
+summary(df2$AgeOfPlane) # There is no more negative minimum AgeOfPlane
+```
+
+The delay for this analysis will be calculated by ArrDelay - CarrierDelay - WeatherDelay - NASDelay – SecurityDelay - LateAircraftDelay. According to the Bureau of Transportation Statistics, ‘CarrierDelay’ is the delay “due to circumstances within the airline's control” and ‘LateAircraftDelay’ is the delay of "a previous flight with same aircraft arrived late, causing the present flight to depart late".
+
+Since ‘CarrierDelay’ is within the airline’s control and the next 3 delays are caused by other external factors, they have no relationship with the age of the planes and hence they are deducted. The deduction of ‘LateAircraftDelay’ is to remove the propagated delay and only capture the delays that could possibly be explained by the age of the aircrafts.
+```{r}
+df2 <- df2 %>% mutate(q2Delay = ArrDelay - CarrierDelay - WeatherDelay - NASDelay - SecurityDelay - LateAircraftDelay)
+
+df2 <- df2 %>% select(TailNum, Year, year_built, AgeOfPlane, q2Delay)
+head(df2)
+```
+
+Creating a stratified sample for plotting the Delay vs Age Of Plane
+```{r}
+max(df2$AgeOfPlane) # The oldest plane is 51 years old
+
+set.seed(1)
+age1_10 <- slice_sample(subset(df2, AgeOfPlane %in% c(0:10)), n=10, replace=TRUE)
+age11_20 <- slice_sample(subset(df2, AgeOfPlane %in% c(11:20)), n=10, replace=TRUE)
+age21_30 <- slice_sample(subset(df2, AgeOfPlane %in% c(21:30)), n=10, replace=TRUE)
+age31_40 <- slice_sample(subset(df2, AgeOfPlane %in% c(31:40)), n=10, replace=TRUE)
+age41_50 <- slice_sample(subset(df2, AgeOfPlane %in% c(41:50)), n=10, replace=TRUE)
+
+sample_scatter <- rbind(age1_10, age11_20, age21_30,age31_40, age41_50)
+```
+
+
+Plotting Delay vs Age of Plane based on created sample
+```{r}
+ggplot(sample_scatter, aes(x=AgeOfPlane, y=q2Delay)) + geom_point() + geom_smooth(method=lm, se=FALSE) + labs(title="Delay vs Age Of Plane of Sample", x="Age Of Plane", y="Delay (in minutes)") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+Even though the regression line has a slight positive gradient, there does not seem to be a clear pattern in the relationship between delays and age of the planes in the sample.
+
+A hypothesis test was performed to test whether there is a significant relationship between delays and age of the planes.
+
+Performing a correlation test between total delay and age of plane
+```{r}
+cor.test(df2$q2Delay, df2$AgeOfPlane, alternative="greater")
+```
+
+From the above test, we can see that the sample correlation is 0.0343 with a p-value of < 2.2e-16. Hence, the null hypothesis of true correlation being smaller than or equal to 0 is rejected and it can be concluded that the true correlation is statistically greater than zero. However, even though the result is statistically significant, it is mainly due to the extreme sample size, and as the correlation is extremely low, near zero, there is no practical significance and meaningful interpretation to the test.
+
+Therefore, it can be concluded that older planes do not suffer more delays.
+
+# Q3) How does the number of people flying between different locations change over time?
+As the dataset does not include the number of passengers on flight, this analysis will be looking at the change in number of flights between states throughout the years.
+
+Plotting number of flights over the years
+```{r}
+ggplot(data=(df %>% group_by(Year) %>% summarize(n=n())), aes(x=Year, y=n)) + geom_line() + geom_point() + scale_x_continuous(breaks=2005:2007) + 
+  labs(title="Number of flights throughout the years", y="Number of flights") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The number of flights has been increasing over the years.
+
+Loading the airports.csv file
+```{r}
+airports <- read.csv("airports.csv")
+```
+
+Creating a dataframe that shows the flights data with the states of departure and arrival airports.
+```{r}
+ori_dest_df <- df[c('Year','Origin','Dest')]
+ori_dest_df <- ori_dest_df %>% left_join(select(airports, iata, state), by = c("Origin" = "iata")) %>% left_join(select(airports, iata, state), by = c("Dest" = "iata"))
+ori_dest_df <- rename(ori_dest_df, OriginState=state.x)
+ori_dest_df <- rename(ori_dest_df, DestState=state.y)
+
+# Checking if there are any NAs
+any(is.na(ori_dest_df)) # There are NAs in the dataframe
+ori_dest_df %>% filter(is.na(OriginState) | is.na(DestState)) %>% unique() %>% head()
+```
+We can see that there are airports with missing states from the airports.csv file from table above.
+
+Checking airports with missing states
+```{r}
+ori_dest_df %>% filter(is.na(OriginState)) %>% subset(select=c('Origin')) %>% unique() %>% rename(iata=Origin)
+```
+
+```{r}
+ori_dest_df %>% filter(is.na(DestState)) %>% subset(select=c('Dest')) %>% unique()
+```
+From both of the table, we can see that SCE, CLD, MQT, and HHH airports have missing states. They are located in Pennsylvania (PA), California (CA), Michigan (MI), and South Carolina (SC) respectively.
+
+Filling up the states of airports with missing data
+```{r}
+airports[airports['iata']=="SCE",]['state'] <- "PA"
+airports[airports['iata']=="CLD",]['state'] <- "CA" 
+airports[airports['iata']=="MQT",]['state'] <- "MI"
+airports[airports['iata']=="HHH",]['state'] <- "SC"
+
+ori_dest_df <- df[c('Year','Origin','Dest')]
+ori_dest_df <- ori_dest_df %>% left_join(select(airports, iata, state), by = c("Origin" = "iata")) %>% left_join(select(airports, iata, state), by = c("Dest" = "iata"))
+ori_dest_df <- rename(ori_dest_df, OriginState=state.x)
+ori_dest_df <- rename(ori_dest_df, DestState=state.y)
+
+any(is.na(ori_dest_df)) # There are no longer any NAs in the dataframe
+
+```
+
+Performing data wrangling for visualisation
+```{r} 
+ori_dest_df_wide <- ori_dest_df %>% group_by(Year, OriginState, DestState) %>% summarize(n=n()) %>% pivot_wider(names_from= Year, values_from = n, names_prefix=("flightcounts_")) # Creating a wider dataframe based on number of flights 
+head(ori_dest_df_wide)
+```
+
+```{r}
+# Creating rows for states which do not have flights to/from the other states
+for (i in unique(ori_dest_df_wide$OriginState)) {
+    for (j in unique(ori_dest_df_wide$OriginState)) {
+        if (nrow(ori_dest_df_wide %>% filter(OriginState==i) %>% filter(DestState==j)) == 0) {
+            ori_dest_df_wide <- ori_dest_df_wide %>% rbind(data.frame(OriginState=i, DestState=j))
+        }
+    }
+}
+
+tail(ori_dest_df_wide)
+```
+
+```{r}
+# Calculating the difference in flights in 2007 compared to 2005
+for (i in 1: nrow(ori_dest_df_wide)) {
+    if(is.na(ori_dest_df_wide[i,'flightcounts_2005'])) {
+        ori_dest_df_wide[i, 'flightsincrease'] <- ori_dest_df_wide[i, 'flightcounts_2007']
+    } else {
+        ori_dest_df_wide[i, 'flightsincrease'] <- ori_dest_df_wide[i, 'flightcounts_2007'] - ori_dest_df_wide[i,'flightcounts_2005']
+    }
+}
+
+# Binning the values of the change in number of flights 
+ori_dest_df_wide$flightsincreasefactor <- cut(ori_dest_df_wide$flightsincrease, breaks=c(min(ori_dest_df_wide$flightsincrease,na.rm=T),-1000, -800,-600,-400,-200, -0.1 ,0.1, 200, 400,600,800,1000, max(ori_dest_df_wide$flightsincrease,na.rm=T)), labels = c("≤ -1000","-801 to -1000","-601 to -800","-401 to -600", "-201 to -400","-1 to -200", "0", "1 to 200", "201 to 400", "401 to 600", "601 to 800", "801 to 1000", "≥ 1000"))
+
+head(ori_dest_df_wide)
+```
+```{r}
+# Scraping data for longitude and latitude of states. Data is scraped from https://developers.google.com/public-data/docs/canonical/states_csv
+states_csv_html <- read_html("https://developers.google.com/public-data/docs/canonical/states_csv")
+stateslonglat<- html_nodes(states_csv_html, ".devsite-article-body") %>% .[[1]] %>% html_table() %>% as.data.frame()
+
+# Checking if there are any missing states in the dataset
+setdiff(union(ori_dest_df_wide$OriginState, ori_dest_df_wide$DestState), stateslonglat$state) # VI (Virgin Islands) has missing longitude and latitude values in the dataset
+```
+
+```{r}
+# Adding VI's latitude and longitude  
+stateslonglat <- stateslonglat %>% rbind(data.frame(state = "VI", latitude = 18.324130, longitude = -64.919550, name = "Virgin Islands"))
+
+# Adding longitude and latitude to Origin State
+ori_dest_df_wide <- ori_dest_df_wide %>% left_join(stateslonglat, by = c("OriginState" = "state")) %>% rename(Origin_lat = latitude, Origin_long = longitude)
+
+# Adding longitude and latitude to Destination State
+ori_dest_df_wide <-  ori_dest_df_wide %>% left_join(stateslonglat, by = c("DestState" = "state")) %>% rename(Dest_lat = latitude, Dest_long = longitude) 
+
+ori_dest_df_wide <- ori_dest_df_wide %>% select(OriginState, DestState, flightcounts_2005, flightcounts_2006, flightcounts_2007, flightsincrease, flightsincreasefactor, Origin_lat, Origin_long, Dest_lat, Dest_long) %>% as.data.frame()
+```
+
+Comparison of top flight routes by number of flights
+```{r}
+# NOT INCLUDED IN REPORT
+
+topflightroutes_2005 <- ori_dest_df_wide %>% select(OriginState, DestState, flightcounts_2005) %>% arrange(desc(flightcounts_2005)) %>% head(10)
+topflightroutes_2005$Route <- paste(topflightroutes_2005$OriginState, "-", topflightroutes_2005$DestState)
+topflightroutes_2005 %>% select(Route, flightcounts_2005)
+topflightroutes_2005_plot <- ggplot(data=topflightroutes_2005, aes(x=reorder(Route, flightcounts_2005), y=flightcounts_2005)) + geom_col(fill='skyblue3') + scale_y_continuous(labels = comma) + coord_flip() +
+  labs(title="Top flight routes in 2005", x="Flight route", y="Number of flights")
+
+topflightroutes_2006 <- ori_dest_df_wide %>% select(OriginState, DestState, flightcounts_2006) %>% arrange(desc(flightcounts_2006)) %>% head(10)
+topflightroutes_2006$Route <- paste(topflightroutes_2006$OriginState, "-", topflightroutes_2006$DestState)
+topflightroutes_2006 %>% select(Route, flightcounts_2006)
+topflightroutes_2006_plot <- ggplot(data=topflightroutes_2006, aes(x=reorder(Route, flightcounts_2006), y=flightcounts_2006)) + geom_col(fill='skyblue3') + scale_y_continuous(labels = comma) + coord_flip() +
+  labs(title="Top flight routes in 2006", x="Flight route", y="Number of flights")
+
+topflightroutes_2007 <- ori_dest_df_wide %>% select(OriginState, DestState, flightcounts_2007) %>% arrange(desc(flightcounts_2007)) %>% head(10)
+topflightroutes_2007$Route = paste(topflightroutes_2007$OriginState, "-", topflightroutes_2007$DestState)
+topflightroutes_2007 %>% select(Route, flightcounts_2007)
+topflightroutes_2007_plot <- ggplot(data=topflightroutes_2007, aes(x=reorder(Route, flightcounts_2007), y=flightcounts_2007)) + geom_col(fill='skyblue3') + scale_y_continuous(labels = comma) + coord_flip() +
+  labs(title="Top flight routes in 2007", x="Flight route", y="Number of flights") 
+```
+
+```{r}
+# NOT INCLUDED IN REPORT
+
+topflightroutes_2005_plot
+```
+
+```{r}
+# NOT INCLUDED IN REPORT
+
+topflightroutes_2006_plot
+```
+
+```{r}
+# NOT INCLUDED IN REPORT
+
+topflightroutes_2007_plot
+```
+
+```{r} 
+# NOT INCLUDED IN REPORT
+
+ggarrange(topflightroutes_2005_plot, topflightroutes_2006_plot, topflightroutes_2007_plot, nrow=1)
+```
+
+Plotting heatmap to show the change in number of lights from 2005 to 2007.
+```{r}
+mapcolor <- c("#ff0000", "#ff3333", "#ff6666", "#ffabab", "#ffcccc", "#ffdddd", "#FFFFFF", "#ccffcc","#b3ffb3","#99ff99","#80ff00","#4dff4d","#1d9c00")
+
+ggplot(ori_dest_df_wide, aes(x=OriginState, y=DestState, fill=flightsincreasefactor)) +
+  geom_tile(color="white") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1),
+        axis.text = element_text(size=6)) + 
+  scale_y_discrete(limits = rev) +
+  scale_fill_manual(values = mapcolor, name="Change in number of flights", na.value="black") +
+  guides(fill = guide_legend(reverse=TRUE)) +
+  labs(title="Change in number of flights in 2007 compared to 2005", 
+       x="Origin State", y="Destination State")
+
+```
+
+Plotting change in number of flights over different states.
+```{r}
+# NOT INCLUDED IN REPORT
+
+wholeusa_coords <- c(-158, # min longitude 
+              16, # min latitude 
+              -60, # max longitude 
+              64) # max latitude 
+
+wholeusa_map <- get_map(wholeusa_coords)
+
+ggmap(wholeusa_map) + geom_segment(data=(ori_dest_df_wide %>% filter(!is.na(ori_dest_df_wide$flightsincreasefactor))),
+                              aes(x=Origin_long,
+                                  y=Origin_lat,
+                                  xend=Dest_long,
+                                  yend=Dest_lat,
+                                  colour=flightsincreasefactor), alpha=0.2)  +
+    geom_point(data=ori_dest_df_wide, aes(x=Origin_long, Origin_lat), size=1, color="#746FB2", alpha=0.1) +
+     guides(colour = guide_legend(reverse=TRUE, override.aes = list(alpha = 1))) + 
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.title.x = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks = element_blank(),
+          legend.title = element_text(size=7),
+          legend.text = element_text(size=7)) +
+  scale_color_manual(name= "Change in number of flights", values=mapcolor) +
+  labs(title = "Change in number of flights in 2007 compared to 2005")
+```
+
+Zooming in on only contiguous United States
+```{r}
+usa_coords <- c(-127, 24,-64, 50) 
+usa_map <- get_map(usa_coords)
+
+ggmap(usa_map) + geom_segment(data=(ori_dest_df_wide %>% filter(!is.na(ori_dest_df_wide$flightsincreasefactor))),
+                              aes(x=Origin_long,
+                                  xend=Dest_long,
+                                  y=Origin_lat,
+                                  yend=Dest_lat,
+                                  colour=flightsincreasefactor), alpha=0.2)  +
+    geom_point(data=ori_dest_df_wide, aes(x=Origin_long, Origin_lat), size=1, color="#746FB2", alpha=0.1) +
+     guides(colour = guide_legend(reverse=TRUE, override.aes = list(alpha = 1))) + 
+    theme(plot.title = element_text(size=11, hjust = 0.5),
+          axis.title.x = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks = element_blank(),
+          legend.title = element_text(size=7),
+          legend.text = element_text(size=7)) +
+  scale_color_manual(name= "Change in number of flights", values=mapcolor) +
+  labs(title = "Change in number of flights in 2007 compared to 2005 (Contiguous US)")
+```
+
+Plotting presence of flights routes between states
+```{r}
+statescombi_df <- ori_dest_df_wide %>% mutate(Flight_2005 = ifelse(is.na(flightcounts_2005), 0, 1)) # Flight_2005 takes value 1 if there is presence of flight between Origin and Dest States in 2005, 0 otherwise.
+
+# Comparing presence of flight to the previous year. If both years has flight, 'Change' takes 1. If last year does not have flight but this year does, it takes 2. If last year has flight but this year does not, it takes -1. If both years does not have flight, it takes 0.
+
+for (i in 1:nrow(statescombi_df)) {
+  if (is.na(statescombi_df[i, 'flightcounts_2005']) & !is.na(statescombi_df[i, 'flightcounts_2006'])) {
+    statescombi_df[i, 'Change_2006'] <- 2
+  } else if (!is.na(statescombi_df[i, 'flightcounts_2005']) & is.na(statescombi_df[i, 'flightcounts_2006'])) {
+    statescombi_df[i, 'Change_2006'] <- -1
+  } else if (is.na(statescombi_df[i, 'flightcounts_2005']) & is.na(statescombi_df[i, 'flightcounts_2006'])) {
+    statescombi_df[i, 'Change_2006'] <- 0
+  } else {
+    statescombi_df[i, 'Change_2006'] <- 1
+  }
+}
+
+for (i in 1:nrow(statescombi_df)) {
+  if (is.na(statescombi_df[i, 'flightcounts_2006']) & !is.na(statescombi_df[i, 'flightcounts_2007'])) {
+    statescombi_df[i, 'Change_2007'] <- 2
+  } else if (!is.na(statescombi_df[i, 'flightcounts_2006']) & is.na(statescombi_df[i, 'flightcounts_2007'])) {
+    statescombi_df[i, 'Change_2007'] <- -1
+  } else if (is.na(statescombi_df[i, 'flightcounts_2006']) & is.na(statescombi_df[i, 'flightcounts_2007'])) {
+    statescombi_df[i, 'Change_2007'] <- 0
+  } else {
+    statescombi_df[i, 'Change_2007'] <- 1
+  }
+}
+
+head(statescombi_df)
+```
+
+```{r}
+heatmapcolor = c("#ff0000","black", "#E5E5E5", "#4ADE00")
+heatmaplabels = c("Removed flight route", "No flight route", "Presence of flight route", "Added flight route")
+
+ggplot(statescombi_df, aes(x=OriginState, y=DestState, fill=as.factor(Flight_2005))) + geom_tile(color="white") + 
+  scale_fill_manual(values=c("black", "grey90"), labels=c("No flight route", "Presence of flight route")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1),
+        axis.text = element_text(size=6),
+        legend.title = element_text(size=7),
+        legend.title.align=0.5) +
+  scale_y_discrete(limits = rev) +
+  guides(fill = guide_legend(reverse=TRUE, title="Flights between\nOrigin State and Destination State")) + 
+  labs(title="Presence of flight routes between states in 2005", 
+       x="Origin State", y="Destination State",
+       caption= paste("State combinations with connecting flight:", sum(statescombi_df$Flight_2005), "\n\n"))
+```
+
+```{r}
+ggplot(statescombi_df, aes(x=OriginState, y=DestState, fill=factor(Change_2006))) + geom_tile(color="white") + 
+  scale_fill_manual(values=heatmapcolor, labels=heatmaplabels) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1),
+        axis.text = element_text(size=6),
+        legend.title = element_text(size=7),
+        legend.title.align=0.5) +
+  scale_y_discrete(limits = rev) +
+  guides(fill = guide_legend(reverse=TRUE,  title="Flights between\nOrigin State and Destination State")) + 
+  labs(title="Presence of flight routes between states in 2006 compared to 2005", 
+       x="Origin State", y="Destination State",
+       caption= paste("State combinations with connecting flight:", sum(statescombi_df['Change_2006'] == 1) + sum(statescombi_df['Change_2006'] == 2), "\nAdded flight routes: ", sum(statescombi_df['Change_2006']==2), "\nRemoved flight routes: ", sum(statescombi_df['Change_2006']==-1)))
+```
+
+```{r}
+ggplot(statescombi_df, aes(x=OriginState, y=DestState, fill=factor(Change_2007))) + geom_tile(color="white") + 
+  scale_fill_manual(values=heatmapcolor, labels=heatmaplabels) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1),
+        axis.text = element_text(size=6),
+        legend.title = element_text(size=7),
+        legend.title.align=0.5) +
+  scale_y_discrete(limits = rev) +
+  guides(fill = guide_legend(reverse=TRUE,  title="Flights between\nOrigin State and Destination State")) + 
+  labs(title="Presence of flight routes between states in 2007 compared to 2006", 
+       x="Origin State", y="Destination State",
+       caption= paste("State combinations with connecting flight:", sum(statescombi_df['Change_2007'] == 1) + sum(statescombi_df['Change_2007'] == 2), "\nAdded flight routes: ", sum(statescombi_df['Change_2007']==2), "\nRemoved flight routes: ", sum(statescombi_df['Change_2007']==-1))) 
+```
+
+From the heatmap, we can see which are the flight routes that have increased or decreased number of flights compared to 2005. The black tiles (representing NAs) are states that do not have connecting flights in 2007. 
+
+The map shows a higher concentration of red lines within the East Coast, indicating that there are more number of flight decreases in the area.
+
+From the line graph, the number of flights has been increasing over the years.
+
+The tiles show the the states which have connecting flights and which do not. The combinations of states which have connecting flights have also increased over the years as shown on the bottom right corner. There were 1241 state combinations with connecting flight in 2005 and it increased to 1317 in 2007, indicating that the flight routes are getting more interconnected. This means that there are now more direct flights between states and passengers require fewer flight transfers to get to their destinations.
+
+In conclusion, the number of people flying, which can be implied by the number of flights, between different locations have been increasing over the years with the addition of new flight routes connecting more states. However, one notable point is that the flights within the East Coast seem to have decreased over the years.
+
+# Q4) Can you detect cascading failures as delays in one airport create delays in others?
+According to the Bureau of Transportation Statistics, LateAircraftDelay is the delay of "a previous flight with same aircraft arrived late, causing the present flight to depart late" and "flights are on-time if they depart from the gate or arrive at the gate less than 15 minutes after their scheduled departure or arrival times". Hence, a flight is considered to have propagated delay if it arrived late to the origin airport (denoted by positive LateAircraftDelay) and also arrived late at the next destination airport (more than 15 minutes of ArrDelay). To identify cascading delays that are caused by the airports, flights with propagated delay and ArrDelay larger than the sum of LateAircraftDelay, WeatherDelay, and CarrierDelay (i.e. delays which are not caused by the airports) are filtered.
+
+```{r}
+# Filtering flights with positive LateAircraftDelay, ArrDelay > 15 minutes, and ArrDelay > LateAircraftDelay + WeatherDelay + CarrierDelay
+df4 <- df
+df4['LateAircraftDelay + WeatherDelay + CarrierDelay'] <- df4['LateAircraftDelay'] + df4['WeatherDelay'] + df4['CarrierDelay']
+df4 <- df4 %>% filter(LateAircraftDelay > 0 & ArrDelay > 15 & ArrDelay > (LateAircraftDelay + WeatherDelay + CarrierDelay))
+```
+
+Example flight with cascading delay
+```{r}
+df4 %>% filter(((df4$LateAircraftDelay + df4$WeatherDelay + df4$CarrierDelay)!=df4$LateAircraftDelay) & df4$WeatherDelay!=0 & df4$CarrierDelay!=0) %>% head(1) %>% select(Year, Month, DayofMonth, FlightNum, Origin, Dest, ArrDelay, CarrierDelay, WeatherDelay, NASDelay, SecurityDelay, LateAircraftDelay)
+```
+From the above dataframe, we can see that the flight arrived at the origin airport late by 123 minutes but arrived at the destination airport late by 155 minutes, an additional 32 minutes. Since there was also CarrierDelay of 1 minute and WeatherDelay of 5 minutes, the extra 26 minutes after deduction of the two delays indicates that the flight was cascading-delayed and the extra time must have been caused by the inefficiency in one of or both the airports. For example, the origin and/or destination airports do not have runway for the late aircraft to land or takeoff, or it could also be caused by other delays within the airport (which would be denoted by positive NASDelay or SecurityDelay).
+
+To identify airports that are most likely to cause cascading failures, the flight routes are filtered based on three conditions:
+1) The average cascading delay of the flight route is at least 15 minutes
+2) At least 10% of flights of the route has cascading delay
+3) The flights count of the route is more than or equal to 1000
+
+```{r}
+# Calculating the number of cascading-delayed flights
+df4 <- df4 %>% group_by(Origin, Dest) %>% summarize(avgcascadedelay = mean(LateAircraftDelay + WeatherDelay + CarrierDelay), cascadedelay_count=n())  %>% arrange(desc(cascadedelay_count))
+
+# Calculating the flight count of all the flight routes
+ori_dest_total_df <- ori_dest_df %>% group_by(Origin, Dest) %>% summarize(flight_count=n())
+ori_dest_total_df
+
+# Combining the 2 dataframes to calculate percentage of cascading-delayed flights
+df4 <- df4 %>% left_join(ori_dest_total_df, by=c('Origin'='Origin', 'Dest'='Dest')) %>% mutate(cascadedelay_percentage = cascadedelay_count / flight_count * 100)
+df4 <- df4 %>% select(Origin, Dest, avgcascadedelay, cascadedelay_count, flight_count, cascadedelay_percentage) # Rearrange columns
+
+# Filtering flight routes with average cascading delays of at least 15 minutes, at least 10% of the flights having cascading delay and flight counts more than or equal to 1000
+df4 <- df4 %>% filter(avgcascadedelay >= 15 & cascadedelay_percentage >= 10 & flight_count >= 1000)
+head(df4)
+```
+
+```{r}
+# Getting the total flight count (number of flights arriving to and departing from) in each airport
+origin_counts <- df %>% group_by(Origin) %>% summarize(n=n()) %>% rename(Airport=Origin)
+dest_counts <- df %>% group_by(Dest) %>% summarize(n=n())%>% rename(Airport=Dest)
+airport_counts <- rbind(origin_counts, dest_counts) %>% group_by(Airport) %>% summarize(totalflight_count=sum(n)) %>% arrange(desc(totalflight_count)) 
+airport_counts
+```
+
+```{r}
+# Creating a dataframe of the airports that will be plotted
+nodes <- airports %>% left_join(airport_counts, by=c("iata" = "Airport")) %>% select(iata, lat, long, totalflight_count) %>% mutate(Color= ifelse(totalflight_count < 500000, "#6bb7ff", ifelse(totalflight_count < 1000000, "#d67be8", "#5c52d1")))
+
+df4 <- df4 %>% left_join((airports %>% select(iata, long, lat)), by=c("Origin"="iata")) %>% rename(long_origin = long) %>% rename(lat_origin = lat) %>% left_join((airports %>% select(iata, long, lat)), by=c("Dest"="iata")) %>% rename(long_dest = long) %>% rename(lat_dest= lat)
+
+# Initializing a network graph
+G<-graph_from_data_frame(df4, vertices=nodes)
+
+# Adding number of connections (degrees) to each airport
+nodes$weight <- degree(G)
+nodes <- nodes %>% filter(weight!=0) # Removing airports that are not relevant
+head(nodes)
+```
+
+Plotting network visualisation of airports with cascading delays
+```{r}
+map_nolabels <- get_stamenmap(usa_coords, zoom=4, maptype = 'terrain-background')
+
+ggmap(map_nolabels) +
+  geom_segment(data=df4, aes(x=long_origin, y=lat_origin, xend=long_dest, yend=lat_dest), color="#ff0000", alpha=0.5, arrow=arrow(length = unit(0.2,"cm"), type = "closed")) +
+  geom_point(data=nodes, aes(x=long, y=lat, size=ifelse(weight>5, weight/2, weight*2), color=Color), alpha=0.6) + # For better representation of node size 
+  geom_text(data=nodes, aes(x = long, y = lat, label = iata, color=ifelse(Color=="#5c52d1", 'white', 'black')), hjust = 0, nudge_x = -0.65, size = 2) +
+  scale_color_identity(guide="legend", limits = c("#5c52d1", "#d67be8", "#6bb7ff"), labels=c("Airports with ≥ 1m flights", "Airports with 500k - 1m flights", "Airports with < 500k flights")) +
+  scale_size_identity() + 
+    theme(plot.title = element_text(size=11, hjust = 0.5),
+          axis.title.x=element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = c(0.15, 0.13),
+          legend.background = element_rect(fill = "white", color = "black"),
+          legend.title=element_blank()) +
+  labs(title = "Network visualisation of airports with cascading delays")
+```
+
+```{r}
+# Checking number of degrees of DFW
+degree(G)['DFW']
+```
+
+```{r}
+# Checking number of degrees of EWR
+degree(G)['EWR']
+```
+
+```{r}
+# Checking number of flights for DFW
+airport_counts %>% filter(Airport == "DFW")
+```
+
+```{r}
+# Checking number of flights for EWR
+airport_counts %>% filter(Airport == "EWR")
+```
+
+```{r}
+# Checking top airport
+head(airport_counts, 1)
+```
+From the network visualisation, we can see which are the airports that are most likely to cause cascading delays. The size of the nodes represents the number of connections (edges) to the airport that meets the criteria set above. Hence, the larger the node, the more likely the airport causes cascading delays. For instance, looking at ORD, it has many incoming and outgoing flights with cascading delays. This means that the airport is inefficient in handling both inbound and outbound flights that were late.
+
+Additionally, it can be seen that the number of flights handled by an airport, which is denoted by the colour of the node, does not determine the extent of the cascading delays. For example, comparing DFW and EWR (at the cluster of airports in the East), DFW is the 4th largest airport by number of flights and handles 95% more flights than EWR, but the size of the node of DFW is much smaller than EWR’s (DFW has 4 edges while EWR has 31). Furthermore, ATL, which has the highest number of flight counts, does not appear in the visualisation, indicating that a high volume of flights does not necessarily cause more delays. 
+
+In conclusion, cascading failures can be detected and the airports shown in the above visualisation have critical points of failure, causing cascading failures that amplify existing delays to the next airport.
+
+# Q5) Use the available variables to construct a model that predicts delays.
+According to the Bureau of Transportation Statistics, "flights are on-time if they depart from the gate or arrive at the gate less than 15 minutes after their scheduled departure or arrival times". Hence for this analysis, a flight will be considered late if it arrives more than 15 minutes after its scheduled arrival time. A target variable column, 'Delayed', will be created which takes value 1 or 0. Delayed = 1 if ArrDelay exceeds 15 minutes, 0 otherwise. Only variables that will are prior to a flight’s scheduled departure will be used as features in the prediction. Binary classification will be performed to predict whether a flight will be delayed or not. 
+
+Features that will be used to predict delays in a flight:
+
+Categorical features: 
+
+* Month - Month
+* DayOfWeek - Day of Week 
+* UniqueCarrier - Unique Carrier
+* Origin - Origin airport*
+* Dest - Destination airport*
+* HourOfDay_Dep - Hourly interval based on scheduled departure time (CRSDepTime)
+* HourOfDay_Arr - Hourly interval based on scheduled arrival time (CRSArrTime)
+
+*Airports not in the top 100 airports by number of flights will be categorised as 'Others'
+
+Numerical feature:
+* Distance - Distance between airports (miles)
+
+As there are too many airports and some airports have only a few flights, the top 100 airports by number of flights will remain as it is, and the rest will be grouped as 'Others' for the analysis. Due to the large dataset, a subsample of 100,000 random observations was used for the analysis. The 100,000 observations will be split into 70% as training set and 30% as test set. Logistic Regression, Gradient Boosting, Classification Tree, and Random Forest will be compared to see which algorithm provides the best prediction.
+```{r}
+# Getting largest 100 airports by number of flights
+topairports <- airport_counts %>% .$Airport %>% head(100) %>% as.vector()
+```
+
+```{r}
+# Preparing data frame to apply Machine Learning 
+
+# Adding columns 'HourOfDay_Dep' and 'HourOfDay_Arr' to specify the hourly interval the scheduled departure time (CRSDepTime) and scheduled arrival time (CRSArrTime) is in. 
+
+df5 <- df %>% mutate(HourOfDay_Dep=ifelse(nchar(CRSDepTime)==4, substr(CRSDepTime,1,2), ifelse(nchar(CRSDepTime)==3, substr(CRSDepTime,1,1), ifelse(nchar(CRSDepTime)<3, 0, NA)))) %>% mutate(HourOfDay_Arr=ifelse(nchar(CRSArrTime)==4, substr(CRSArrTime,1,2), ifelse(nchar(CRSArrTime)==3, substr(CRSArrTime,1,1), ifelse(nchar(CRSArrTime)<3, 0, NA))))
+
+# Creating 'Delayed' column. Delayed = 1 if ArrDelay exceeds 15 minutes, 0 otherwise. 
+df5 <- df5 %>% mutate(Delayed = ifelse(ArrDelay>15, 1, 0)) 
+
+df5 <- df5 %>% select(Month, DayOfWeek, UniqueCarrier, Origin, Dest, Distance, HourOfDay_Dep, HourOfDay_Arr, Delayed) # Keeping only columns that will be used as features and target variable.
+
+# Grouping airports not in the top 100 airports into 'Others'
+df5 <- df5 %>% mutate(Origin = ifelse(Origin %in% topairports, Origin, "Others"))
+df5 <- df5 %>% mutate(Dest = ifelse(Dest %in% topairports, Dest, "Others"))
+
+# Data pre-processing 
+# Converting columns from strings to factors
+df5$Delayed <- as.factor(df5$Delayed)
+df5$Month <- as.factor(df5$Month)
+df5$DayOfWeek <- as.factor(df5$DayOfWeek)
+df5$UniqueCarrier <- as.factor(df5$UniqueCarrier)
+df5$Origin <- as.factor(df5$Origin)
+df5$Dest <- as.factor(df5$Dest)
+df5$HourOfDay_Dep <- as.factor(df5$HourOfDay_Dep)
+df5$HourOfDay_Arr <- as.factor(df5$HourOfDay_Arr)
+
+# Selecting 100,000 random samples 
+set.seed(1)
+df5 <- slice_sample(df5, n=100000, replace=TRUE)
+
+# Splitting data into training and test set
+n <- nrow(df5)
+train_set <- sample(n, round(0.7*n))
+test_set <- setdiff(1:n, train_set)
+```
+
+Visualising counts of Delayed vs On Time flights
+```{r}
+df5 %>% count(Delayed) %>% mutate(percentage=prop.table(n)) %>%
+  ggplot(aes(x=Delayed, y=n, fill=Delayed, label = scales::percent(percentage))) +
+  geom_col() + geom_text(vjust=-0.5, size=3) +
+  scale_x_discrete(labels=c("On Time", "Delayed")) + labs(y="count") + theme(legend.position="none")
+```
+
+There is an imbalance between delayed and on time flights.
+
+```{r}
+# Data pre-processing
+task <- TaskClassif$new('delayprediction', backend=df5, target = 'Delayed')
+measure <- msr('classif.ce')
+
+factorencoder <- po("encode", method = "treatment",
+  affect_columns = selector_type("factor"))
+ord_to_int <- po("colapply", applicator = as.integer,
+  affect_columns = selector_type("ordered"))
+
+tuner <- tnr('grid_search')
+terminator <- trm('evals', n_evals = 20)
+
+# Logistic regression
+learner_lr <- lrn("classif.log_reg", predict_type="prob")
+gc_lr <- po('imputemean', affect_columns=selector_type("numeric")) %>>%
+  po('imputemode', affect_columns=selector_type(c("factor", "ordered"))) %>>%
+  po(learner_lr)
+glrn_lr <- GraphLearner$new(gc_lr)
+
+# Gradient boosting
+learner_gb <- lrn("classif.xgboost", predict_type="prob")
+gc_gb <- po('imputemean', affect_columns=selector_type("numeric")) %>>%
+  po('imputemode', affect_columns=selector_type(c("factor", "ordered"))) %>>%
+  factorencoder %>>% ord_to_int %>>%
+  po(learner_gb)
+glrn_gb <- GraphLearner$new(gc_gb)
+
+# Classification tree
+learner_tree <- lrn("classif.rpart", predict_type="prob")
+gc_tree <- po('imputemean', affect_columns=selector_type("numeric")) %>>%
+  po('imputemode', affect_columns=selector_type(c("factor", "ordered"))) %>>%
+  po(learner_tree)
+glrn_tree <- GraphLearner$new(gc_tree)
+
+# Random forest
+learner_rf <- lrn('classif.ranger', predict_type="prob")
+learner_rf$param_set$values <- list(min.node.size = 4)
+gc_rf <- po('imputemean', affect_columns=selector_type("numeric")) %>>%
+  po('imputemode', affect_columns=selector_type(c("factor","ordered"))) %>>%
+  po(learner_rf)
+glrn_rf <- GraphLearner$new(gc_rf)
+tune_ntrees <- ParamSet$new (list(ParamInt$new('classif.ranger.num.trees', lower = 50, upper = 600)))
+at_rf <- AutoTuner$new(
+  learner = glrn_rf,
+  resampling = rsmp('cv', folds = 3),
+  measure = measure,
+  search_space = tune_ntrees,
+  terminator = terminator,
+  tuner = tuner)
+
+set.seed(1)
+lrn_list <- list(glrn_lr, glrn_gb, glrn_tree, at_rf)
+
+# Create benchmark design to compare different algorithms
+bm_design <- benchmark_grid(task = task, resamplings = rsmp('cv', folds=2), learners = lrn_list)
+bmr <- benchmark(bm_design, store_models = TRUE)
+
+autoplot(bmr) + scale_x_discrete(labels = c("Logistic Regression", "Gradient Boosting", "Classification Tree", "Random Forest"))
+```
+
+Summary of comparisons
+```{r}
+# NOT INCLUDED IN REPORT
+
+bmr$aggregate(measure)
+```
+
+Plotting the ROC curves of the various models
+```{r}
+autoplot(bmr, type = "roc") +
+  scale_color_discrete(labels = c("Logistic Regression", "Gradient Boosting", "Classification Tree", "Random Forest")) +
+  labs(title="ROC curve of various algorithms") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+From the benchmarking results, the 4 classifiers have similar classification error. From the ROC curves, Classification Tree performed the worst with a diagonal line, indicating that the model has almost no predictive power, hence we will just look at the other 3 models.
+
+Confusion Matrix of the 3 models (mlr3's default confusion matrix)
+```{r}
+# NOT INCLUDED IN REPORT
+
+models <- list(glrn_lr, glrn_gb, at_rf)
+models_string <- c("lr", "gb", "rf")
+
+for (i in 1:length(models)) {
+    models[[i]]$train(task, row_ids = train_set)
+    assign(paste0("cm_", models_string[i]), models[[i]]$predict(task, row_ids=test_set)$confusion)
+    }
+```
+
+Confusion Matrix of Logistic Regression
+```{r}
+# NOT INCLUDED IN REPORT
+
+cm_lr
+```
+
+Confusion Matrix of Gradient Boosting
+```{r}
+# NOT INCLUDED IN REPORT
+
+cm_gb
+```
+
+Confusion Matrix of Random Forest
+```{r}
+# NOT INCLUDED IN REPORT
+
+cm_rf
+```
+
+Confusion Matrix of the 3 models (Improved)
+```{r}
+all_cm <- list(cm_lr, cm_gb, cm_rf)
+names(all_cm) <- c("Logistic Regression", "Gradient Boosting", "Random Forest")
+
+for (i in 1:length(all_cm)) {
+    cmtable <- data.frame(all_cm[[i]]) %>% mutate(Proportion = Freq/sum(Freq)) %>% mutate(Prediction = ifelse(response==truth, "Correct", "Wrong"))
+    assign(paste0("newcm_", models_string[i]), 
+           ggplot(cmtable, aes(x=response, y=truth, fill=Prediction, alpha=Proportion)) + 
+             geom_tile() + geom_text(aes(label=Freq, alpha=1), size=6, show.legend=FALSE) +
+             scale_fill_manual(values=c(Correct="green4", Wrong="red")) +
+             scale_x_discrete(labels=c("On time", "Delayed")) +
+             scale_y_discrete(limits=rev(levels(cmtable$response)), labels=c("Delayed", "On time")) +
+             scale_alpha(guide="none") +
+             coord_equal() +
+             theme_bw() +
+             theme(plot.title = element_text(hjust = 0.5),
+                   panel.border = element_blank(),
+                   panel.grid.major.x = element_blank(),
+                   panel.grid.major.y = element_blank(),
+                   axis.ticks = element_blank(),
+                   text = element_text(size = 13)) +
+             labs(title=names(all_cm)[i]))
+}
+```
+
+Confusion Matrix of Logistic Regression (Improved)
+```{r}
+newcm_lr
+```
+
+Confusion Matrix of Gradient Boosting (Improved)
+```{r}
+newcm_gb
+```
+
+Confusion Matrix of Random Forest (Improved)
+```{r}
+newcm_rf
+```
+
+
+```{r}
+# Putting side by side, for export
+ggarrange(newcm_lr, newcm_gb, newcm_rf, nrow=1, legend="right", common.legend=TRUE)
+```
+
+The confusion matrix (of Logistic Regression) is interpreted as follows: 
+
+* response 0, truth 0: 23180 on-time flights in the test set were correctly predicted by the model.
+* response 0, truth 1: 6498 delayed flights in the test set were incorrectly predicted by the model.
+* response 1: truth 0: 138 on-time flights in the test set were incorrectly predicted by the model.
+* response 1: truth 1: 184 delayed flights in the test set were correctly predicted by the model.
+
+Performance of the 3 models
+```{r}
+measures <- msrs(c('classif.acc', 'classif.auc', 'classif.sensitivity', 'classif.specificity'))
+
+for (i in 1:length(models)) {
+  print(paste0(names(all_cm)[i], ":"), quote=FALSE)
+  print(models[[i]]$predict(task, row_ids=test_set)$score(measures))
+  cat("\n")
+}
+```
+
+As the data is highly imbalanced, with 78% of the flights being on time, and only 22% being delayed, the accuracy of the prediction is not a good measure of the performance of the model. For instance, if the model were to predict all the flights being on time, it would have an accuracy of 78% despite not predicting any delayed flights.
+
+Classif.acc is the accuracy of the prediction and classif.auc is the AUC. Classif.sensitivity is the sensitivity of the prediction, which is the measure of correctly predicting no delay. Classif.specificity is the specificity of the prediction, which is the measure of correctly predicting a delay. Comparing by the sensitivity, Gradient Boosting classifier has the highest score, but its specificity is the lowest. This means that the classifier is best at predicting on-time flights but worst at predicting delayed flights. On the other hand, comparing by the specificity, Random Forest classifier has the highest score, but its sensitivity is the lowest. This means that the classifier is best at predicting delayed flights worst at predicting on-time flights. The best model is the one with the highest AUC, which is Logistic Regression.
+
+In conclusion, among the 4 classifiers, Logistic Regression is the best at predicting whether a flight would be delayed.
